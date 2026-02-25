@@ -1,0 +1,444 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NS_NAME="${NS_NAME:-mvpn}"
+WG_IFACE="${WG_IFACE:-mvwg0}"
+VETH_HOST="${VETH_HOST:-mvpn0}"
+VETH_NS="${VETH_NS:-mvpn1}"
+NS_CIDR="${NS_CIDR:-10.200.200.0/24}"
+HOST_VETH_IP="${HOST_VETH_IP:-10.200.200.1/24}"
+NS_VETH_IP="${NS_VETH_IP:-10.200.200.2/24}"
+NS_GW_IP="${NS_GW_IP:-10.200.200.1}"
+
+ALLOW_LAN="${ALLOW_LAN:-1}"         # 1=yes, 0=no
+KILLSWITCH="${KILLSWITCH:-1}"       # 1=yes, 0=no
+
+RUN_DIR="${RUN_DIR:-/run/mullvad-netns}"
+ETC_NETNS_DIR="${ETC_NETNS_DIR:-/etc/netns}"
+HOST_NFT_TABLE="${HOST_NFT_TABLE:-mvpn_netns}"
+NS_NFT_TABLE="${NS_NFT_TABLE:-mvpn_killswitch}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  mullvad-netns up   --config /path/to/mullvad.conf [--user USER] [--] CMD...
+  mullvad-netns exec [--user USER] -- CMD...
+  mullvad-netns repair
+  mullvad-netns down
+  mullvad-netns teardown
+  mullvad-netns status
+
+Environment overrides:
+  NS_NAME=mvpn                 Network namespace name
+  WG_IFACE=mvwg0               WireGuard interface name inside netns
+  VETH_HOST=mvpn0              Host-side veth name
+  VETH_NS=mvpn1                Netns-side veth name
+  NS_CIDR=10.200.200.0/24      Veth subnet (host NAT source)
+  HOST_VETH_IP=10.200.200.1/24 Host veth IP/CIDR
+  NS_VETH_IP=10.200.200.2/24   Netns veth IP/CIDR
+  NS_GW_IP=10.200.200.1        Netns default gateway (host veth IP)
+  ALLOW_LAN=1                  Add routes to host on-link subnets via veth
+  KILLSWITCH=1                 Drop netns egress except via WG/LAN/endpoint
+
+Notes:
+  - Requires root (use sudo).
+  - Does not change host default routes; only the netns uses Mullvad.
+EOF
+}
+
+log() { printf '%s\n' "$*" >&2; }
+die() { log "error: $*"; exit 1; }
+
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "run as root (e.g. sudo $0 ...)"
+  fi
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+default_uplink_iface() {
+  ip -4 route show default 0.0.0.0/0 | awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1
+}
+
+netns_exists() {
+  ip netns list | awk '{print $1}' | grep -Fxq "$NS_NAME"
+}
+
+link_exists() {
+  ip link show "$1" >/dev/null 2>&1
+}
+
+sanitize_wg_config() {
+  local src="$1"
+  local dst="$2"
+  local dns_out="$3"
+
+  [[ -f "$src" ]] || die "config not found: $src"
+
+  mkdir -p "$(dirname "$dst")"
+  mkdir -p "$(dirname "$dns_out")"
+
+  # Extract DNS (optional) for per-netns resolv.conf.
+  awk '
+    BEGIN{IGNORECASE=1}
+    $0 ~ /^[[:space:]]*DNS[[:space:]]*=/ {
+      sub(/^[[:space:]]*DNS[[:space:]]*=[[:space:]]*/, "", $0)
+      print $0
+    }
+  ' "$src" >"$dns_out" || true
+
+  # Keep the config, but strip wg-quick host-wide behaviors.
+  # - DNS: avoid touching host resolv.conf (we set /etc/netns/<ns>/resolv.conf instead)
+  # - Table: let wg-quick manage routes inside the netns
+  # - Hook scripts: keep behavior predictable (killswitch handled separately)
+  awk '
+    BEGIN{IGNORECASE=1}
+    /^[[:space:]]*DNS[[:space:]]*=/ {next}
+    /^[[:space:]]*Table[[:space:]]*=/ {next}
+    /^[[:space:]]*(PreUp|PostUp|PreDown|PostDown)[[:space:]]*=/ {next}
+    {print}
+  ' "$src" >"$dst"
+
+  chmod 600 "$dst"
+}
+
+ensure_netns() {
+  need_cmd ip
+  need_cmd nft
+  need_cmd wg-quick
+  need_cmd getent
+
+  local uplink
+  uplink="$(default_uplink_iface)"
+  [[ -n "$uplink" ]] || die "could not determine host default uplink interface"
+
+  if ! netns_exists; then
+    ip netns add "$NS_NAME"
+  fi
+
+  if ! link_exists "$VETH_HOST"; then
+    ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
+    ip link set "$VETH_NS" netns "$NS_NAME"
+  fi
+
+  ip addr replace "$HOST_VETH_IP" dev "$VETH_HOST"
+  ip link set "$VETH_HOST" up
+
+  ip -n "$NS_NAME" link set lo up
+  ip -n "$NS_NAME" addr replace "$NS_VETH_IP" dev "$VETH_NS"
+  ip -n "$NS_NAME" link set "$VETH_NS" up
+  # Keep the netns "main" table default via the veth gateway so WireGuard's
+  # own marked packets (to its endpoint/DNS) never recurse into the tunnel.
+  ip -n "$NS_NAME" route replace "$NS_CIDR" dev "$VETH_NS" scope link table main || true
+  ip -n "$NS_NAME" route replace default via "$NS_GW_IP" dev "$VETH_NS" table main
+
+  # Host-side NAT/forwarding just for the veth subnet; use a dedicated nft table for clean teardown.
+  if ! nft list table inet "$HOST_NFT_TABLE" >/dev/null 2>&1; then
+    nft -f - <<EOF
+table inet $HOST_NFT_TABLE {
+  chain forward {
+    type filter hook forward priority -100; policy accept;
+    iifname "$VETH_HOST" accept
+    oifname "$VETH_HOST" ct state established,related accept
+  }
+  chain postrouting {
+    type nat hook postrouting priority 100; policy accept;
+    oifname "$uplink" ip saddr $NS_CIDR masquerade
+  }
+}
+EOF
+  fi
+}
+
+onlink_v4_prefixes() {
+  ip -4 route show table main proto kernel scope link | awk '{print $1}' | sort -u
+}
+
+write_netns_resolvconf() {
+  local dns_file="$1"
+  local ns_dir="${ETC_NETNS_DIR}/${NS_NAME}"
+  local out="${ns_dir}/resolv.conf"
+
+  mkdir -p "$ns_dir"
+
+  if [[ -s "$dns_file" ]]; then
+    : >"$out"
+    while IFS= read -r ns; do
+      [[ -n "$ns" ]] || continue
+      printf 'nameserver %s\n' "$ns" >>"$out"
+    done <"$dns_file"
+  else
+    printf 'nameserver 1.1.1.1\n' >"$out"
+  fi
+}
+
+resolve_endpoint_v4() {
+  local endpoint="$1"
+  local host="${endpoint%:*}"
+  local port="${endpoint##*:}"
+
+  [[ "$host" != "$port" ]] || die "Endpoint missing port: $endpoint"
+
+  if [[ "$host" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then
+    printf '%s %s\n' "$host" "$port"
+    return 0
+  fi
+
+  local ip
+  ip="$(getent ahostsv4 "$host" | awk '{print $1}' | head -n1 || true)"
+  [[ -n "$ip" ]] || die "could not resolve endpoint host to IPv4: $host"
+  printf '%s %s\n' "$ip" "$port"
+}
+
+configure_netns_routes() {
+  if [[ "$ALLOW_LAN" != "1" ]]; then
+    return 0
+  fi
+
+  while IFS= read -r prefix; do
+    [[ -n "$prefix" ]] || continue
+    # Never override the veth subnet's connected route; doing so can make the
+    # gateway unreachable and break the tunnel.
+    [[ "$prefix" == "$NS_CIDR" ]] && continue
+    ip -n "$NS_NAME" route replace "$prefix" via "$NS_GW_IP" dev "$VETH_NS" table main || true
+  done < <(onlink_v4_prefixes)
+}
+
+repair_netns_routes() {
+  netns_exists || die "namespace not present: $NS_NAME"
+
+  # Ensure the veth subnet is directly connected in the netns (not "via" the gateway).
+  ip -n "$NS_NAME" route replace "$NS_CIDR" dev "$VETH_NS" scope link table main || true
+
+  # Ensure WireGuard's marked endpoint packets can always egress via veth.
+  ip -n "$NS_NAME" route replace default via "$NS_GW_IP" dev "$VETH_NS" table main
+
+  # Re-apply LAN routes deterministically via the veth gateway.
+  configure_netns_routes
+}
+
+repair_resolvconf() {
+  local dns_path="${RUN_DIR}/dns.txt"
+  local out="${ETC_NETNS_DIR}/${NS_NAME}/resolv.conf"
+
+  if [[ ! -s "$out" ]] || grep -Eq '^[[:space:]]*nameserver[[:space:]]+127\\.0\\.0\\.53([[:space:]]|$)' "$out"; then
+    write_netns_resolvconf "$dns_path"
+  fi
+}
+
+repair_killswitch_from_wg() {
+  [[ "$KILLSWITCH" == "1" ]] || return 0
+  ip -n "$NS_NAME" link show "$WG_IFACE" >/dev/null 2>&1 || return 0
+
+  local ep
+  ep="$(ip netns exec "$NS_NAME" wg show "$WG_IFACE" endpoints 2>/dev/null | awk '{print $2}' | head -n1 || true)"
+  [[ -n "$ep" && "$ep" != "(none)" ]] || return 0
+
+  local endpoint_ip endpoint_port
+  read -r endpoint_ip endpoint_port < <(resolve_endpoint_v4 "$ep")
+  configure_killswitch "$endpoint_ip" "$endpoint_port"
+}
+
+configure_killswitch() {
+  [[ "$KILLSWITCH" == "1" ]] || return 0
+
+  local endpoint_ip="$1"
+  local endpoint_port="$2"
+
+  ip netns exec "$NS_NAME" nft delete table inet "$NS_NFT_TABLE" >/dev/null 2>&1 || true
+
+  # Create a strict output policy inside the netns:
+  # - allow anything via WireGuard iface
+  # - allow LAN prefixes via veth (optional)
+  # - allow reaching the WireGuard endpoint via veth
+  # - drop everything else (prevents leaks if WG goes down)
+  ip netns exec "$NS_NAME" nft -f - <<EOF
+table inet $NS_NFT_TABLE {
+  chain output {
+    type filter hook output priority -150; policy drop;
+    oifname "lo" accept
+    oifname "$WG_IFACE" accept
+    ip daddr $endpoint_ip udp dport $endpoint_port accept
+$(if [[ "$ALLOW_LAN" == "1" ]]; then
+    while IFS= read -r prefix; do
+      [[ -n "$prefix" ]] || continue
+      printf '    ip daddr %s accept\n' "$prefix"
+    done < <(onlink_v4_prefixes)
+  fi)
+  }
+  chain input {
+    type filter hook input priority -150; policy accept;
+  }
+}
+EOF
+}
+
+wg_up() {
+  local src_config="$1"
+
+  mkdir -p "$RUN_DIR"
+  local cfg_path="${RUN_DIR}/${WG_IFACE}.conf"
+  local dns_path="${RUN_DIR}/dns.txt"
+
+  sanitize_wg_config "$src_config" "$cfg_path" "$dns_path"
+  write_netns_resolvconf "$dns_path"
+
+  # Pull endpoint from the (sanitized) config for killswitch.
+  local endpoint
+  endpoint="$(awk 'BEGIN{IGNORECASE=1} $0 ~ /^[[:space:]]*Endpoint[[:space:]]*=/ {sub(/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*/, "", $0); print $0; exit}' "$cfg_path" || true)"
+  [[ -n "$endpoint" ]] || die "could not find Endpoint in config: $src_config"
+  read -r endpoint_ip endpoint_port < <(resolve_endpoint_v4 "$endpoint")
+
+  # Bring up WG inside the namespace.
+  ip netns exec "$NS_NAME" wg-quick up "$cfg_path"
+
+  # Ensure local/LAN routes keep working (more-specific than 0.0.0.0/0 via WG).
+  configure_netns_routes
+
+  # Optional leak protection (inside the namespace only).
+  configure_killswitch "$endpoint_ip" "$endpoint_port"
+}
+
+wg_down() {
+  local cfg_path="${RUN_DIR}/${WG_IFACE}.conf"
+  if ip -n "$NS_NAME" link show "$WG_IFACE" >/dev/null 2>&1; then
+    if [[ -f "$cfg_path" ]]; then
+      ip netns exec "$NS_NAME" wg-quick down "$cfg_path" || true
+    else
+      ip netns exec "$NS_NAME" wg-quick down "$WG_IFACE" || true
+    fi
+  fi
+  ip netns exec "$NS_NAME" nft delete table inet "$NS_NFT_TABLE" >/dev/null 2>&1 || true
+}
+
+cmd_up() {
+  local user="${SUDO_USER:-${USER:-root}}"
+  local config=""
+  local preserve_env="DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR,PULSE_SERVER,SSH_AUTH_SOCK"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config) config="${2:-}"; shift 2 ;;
+      --user) user="${2:-}"; shift 2 ;;
+      --) shift; break ;;
+      -h|--help) usage; exit 0 ;;
+      *) break ;;
+    esac
+  done
+
+  [[ -n "$config" ]] || die "missing --config /path/to/file.conf"
+
+  ensure_netns
+  wg_up "$config"
+
+  if [[ $# -gt 0 ]]; then
+    ip netns exec "$NS_NAME" sudo -H -u "$user" --preserve-env="$preserve_env" -- "$@"
+  else
+    log "up: namespace=$NS_NAME wg=$WG_IFACE"
+    log "hint: sudo $0 exec -- curl -4 ifconfig.me"
+  fi
+}
+
+cmd_exec() {
+  local user="${SUDO_USER:-${USER:-root}}"
+  local preserve_env="DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR,PULSE_SERVER,SSH_AUTH_SOCK"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --user) user="${2:-}"; shift 2 ;;
+      --) shift; break ;;
+      -h|--help) usage; exit 0 ;;
+      *) break ;;
+    esac
+  done
+
+  [[ $# -gt 0 ]] || die "exec requires a command (use -- CMD...)"
+  netns_exists || die "namespace not set up (run: sudo $0 up --config ...)"
+  ip netns exec "$NS_NAME" sudo -H -u "$user" --preserve-env="$preserve_env" -- "$@"
+}
+
+cmd_down() {
+  netns_exists || die "namespace not present: $NS_NAME"
+  wg_down
+  log "down: namespace=$NS_NAME (kept veth + nft table; use teardown to remove)"
+}
+
+cmd_repair() {
+  netns_exists || die "namespace not present: $NS_NAME (run: sudo $0 up --config ...)"
+
+  # Ensure veth + host NAT table exist (no host default-route changes).
+  ensure_netns
+
+  # Fix the common "no IPs / no DNS" failure mode caused by a bad veth-subnet route.
+  repair_netns_routes
+  repair_resolvconf
+  repair_killswitch_from_wg
+
+  log "repair: fixed netns routes/DNS (namespace=$NS_NAME)"
+  log "hint: sudo $0 exec -- curl -4 ifconfig.me/ip"
+}
+
+cmd_teardown() {
+  netns_exists || die "namespace not present: $NS_NAME"
+  wg_down
+  ip link del "$VETH_HOST" >/dev/null 2>&1 || true
+  nft delete table inet "$HOST_NFT_TABLE" >/dev/null 2>&1 || true
+  ip netns del "$NS_NAME" >/dev/null 2>&1 || true
+  rm -rf "${ETC_NETNS_DIR:?}/${NS_NAME}" >/dev/null 2>&1 || true
+  rm -rf "$RUN_DIR" >/dev/null 2>&1 || true
+  log "teardown: removed namespace + rules"
+}
+
+cmd_status() {
+  local nft_cmd=(nft)
+  local ip_cmd=(ip)
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    if sudo -n true >/dev/null 2>&1; then
+      nft_cmd=(sudo -n nft)
+      ip_cmd=(sudo -n ip)
+    fi
+  fi
+
+  echo "ns: $NS_NAME"
+  if netns_exists; then
+    echo "  netns: present"
+    echo "  veth(host): $VETH_HOST $(ip -o -4 addr show dev "$VETH_HOST" 2>/dev/null | awk '{print $4}' | head -n1 || true)"
+    echo "  wg(in ns): $WG_IFACE $(ip -n "$NS_NAME" -o -4 addr show dev "$WG_IFACE" 2>/dev/null | awk '{print $4}' | head -n1 || true)"
+  else
+    echo "  netns: absent"
+  fi
+  if "${nft_cmd[@]}" list table inet "$HOST_NFT_TABLE" >/dev/null 2>&1; then
+    echo "  nft(host): table inet $HOST_NFT_TABLE present"
+  else
+    echo "  nft(host): absent"
+  fi
+  if netns_exists && "${ip_cmd[@]}" netns exec "$NS_NAME" "${nft_cmd[@]}" list table inet "$NS_NFT_TABLE" >/dev/null 2>&1; then
+    echo "  nft(ns): table inet $NS_NFT_TABLE present"
+  else
+    echo "  nft(ns): absent"
+  fi
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    up|exec|repair|down|teardown|status) ;;
+    ""|-h|--help|help) usage; exit 0 ;;
+    *) die "unknown command: $cmd (use --help)" ;;
+  esac
+  shift || true
+
+  case "$cmd" in
+    up) need_root; cmd_up "$@" ;;
+    exec) need_root; cmd_exec "$@" ;;
+    repair) need_root; cmd_repair "$@" ;;
+    down) need_root; cmd_down "$@" ;;
+    teardown) need_root; cmd_teardown "$@" ;;
+    status) cmd_status ;;
+  esac
+}
+
+main "$@"

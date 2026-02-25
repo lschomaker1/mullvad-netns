@@ -1,0 +1,631 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+APP_TITLE = "Mullvad NetNS (split-tunnel)"
+
+if ARGV.include?("--help") || ARGV.include?("-h")
+  puts <<~USAGE
+    #{APP_TITLE}
+
+    Launch the GUI:
+      mullvad-netns-gui
+  USAGE
+  exit 0
+end
+
+# If launched from a Snap-packaged app (e.g. VS Code snap), it may inject GTK
+# paths that can break loading system GTK libs. Prefer the host GTK stack.
+if ENV["SNAP_NAME"] == "code"
+  %w[
+    GTK_EXE_PREFIX
+    GTK_PATH
+    GDK_PIXBUF_MODULEDIR
+    GDK_PIXBUF_MODULE_FILE
+    GTK_IM_MODULE_FILE
+  ].each { |k| ENV.delete(k) }
+end
+
+require "gtk3"
+require "open3"
+require "shellwords"
+
+# Compatibility: some Ruby GTK builds expose `active?` but not `active`.
+begin
+  if defined?(Gtk::CheckButton) &&
+      Gtk::CheckButton.instance_methods.include?(:active?) &&
+      !Gtk::CheckButton.instance_methods.include?(:active)
+    Gtk::CheckButton.class_eval do
+      def active
+        active?
+      end
+    end
+  end
+rescue
+  # ignore
+end
+
+def which(cmd)
+  ENV.fetch("PATH", "").split(":").each do |dir|
+    path = File.join(dir, cmd)
+    return path if File.file?(path) && File.executable?(path)
+  end
+  nil
+end
+
+def sudo_ok?
+  system("sudo", "-n", "true", out: File::NULL, err: File::NULL)
+end
+
+def run_capture(argv, label:, env: {})
+  Thread.new do
+    stdout, stderr, status = Open3.capture3(env, *argv)
+    [label, argv, stdout, stderr, status.exitstatus]
+  end
+end
+
+def run_detached(argv, label:, env: {})
+  Thread.new do
+    pid = Process.spawn(env, *argv, out: File::NULL, err: File::NULL)
+    Process.detach(pid)
+    [label, argv, "spawned pid=#{pid}\n", "", 0]
+  rescue => e
+    [label, argv, "", "#{e.class}: #{e.message}\n", 1]
+  end
+end
+
+def append_text(buffer, text)
+  iter = buffer.end_iter
+  buffer.insert(iter, text)
+end
+
+def show_error(parent, message)
+  dialog = Gtk::MessageDialog.new(parent: parent, flags: :destroy_with_parent, type: :error, buttons_type: :close, message: message)
+  dialog.run
+  dialog.destroy
+end
+
+def default_config_dirs
+  home = Dir.home
+  bases = [
+    File.join(home, "Downloads"),
+    File.join(home, "downloads"),
+  ].select { |p| File.directory?(p) }
+
+  guessed = bases.flat_map do |base|
+    Dir.glob(File.join(base, "*mullvad*")).select { |p| File.directory?(p) }
+  end
+
+  common = [
+    File.join(home, ".config", "wireguard"),
+    File.join(home, "wireguard"),
+    File.join(home, "Mullvad"),
+    File.join(home, "mullvad"),
+  ]
+
+  (guessed + common + bases).uniq.select { |p| File.directory?(p) }
+end
+
+def list_confs(dir)
+  return [] unless dir && !dir.empty? && File.directory?(dir)
+  Dir.children(dir)
+    .select { |f| f.end_with?(".conf") }
+    .sort
+    .map { |f| File.join(dir, f) }
+end
+
+DesktopEntry = Struct.new(:name, :exec, :file, keyword_init: true)
+
+def parse_desktop_file(path)
+  in_entry = false
+  name = nil
+  exec = nil
+  hidden = false
+  nodisplay = false
+
+  File.foreach(path) do |line|
+    line = line.strip
+    next if line.empty? || line.start_with?("#")
+    if line == "[Desktop Entry]"
+      in_entry = true
+      next
+    end
+    next unless in_entry
+
+    k, v = line.split("=", 2)
+    next unless v
+    case k
+    when "Name"
+      name = v
+    when "Exec"
+      exec = v
+    when "Hidden"
+      hidden = (v == "true")
+    when "NoDisplay"
+      nodisplay = (v == "true")
+    end
+  end
+
+  return nil if hidden || nodisplay
+  return nil unless name && exec
+  DesktopEntry.new(name: name, exec: exec, file: path)
+rescue
+  nil
+end
+
+def desktop_entries
+  dirs = [
+    "/usr/share/applications",
+    File.join(Dir.home, ".local/share/applications"),
+  ].select { |d| File.directory?(d) }
+
+  entries = []
+  dirs.each do |dir|
+    Dir.glob(File.join(dir, "*.desktop")).each do |path|
+      entry = parse_desktop_file(path)
+      entries << entry if entry
+    end
+  end
+
+  entries
+    .uniq { |e| [e.name, e.exec] }
+    .sort_by { |e| e.name.downcase }
+end
+
+def sanitize_exec(exec_line)
+  # Remove desktop placeholders like %U, %f, etc; and turn %% into %.
+  s = exec_line.gsub("%%", "%")
+  s = s.gsub(/%[a-zA-Z]/, "")
+  s.strip
+end
+
+def chrome_like_command?(cmdline)
+  parts = Shellwords.split(cmdline)
+  return false if parts.empty?
+  exe = File.basename(parts[0].to_s)
+  %w[
+    google-chrome
+    google-chrome-stable
+    chromium
+    chromium-browser
+    brave
+    brave-browser
+  ].include?(exe)
+rescue
+  false
+end
+
+def has_user_data_dir?(cmdline)
+  Shellwords.split(cmdline).any? { |p| p.start_with?("--user-data-dir=") } ||
+    Shellwords.split(cmdline).each_with_index.any? { |p, i| p == "--user-data-dir" && i < Shellwords.split(cmdline).length - 1 }
+rescue
+  false
+end
+
+def ensure_user_data_dir(cmdline, dir)
+  return cmdline if dir.to_s.strip.empty?
+  return cmdline unless chrome_like_command?(cmdline)
+  return cmdline if has_user_data_dir?(cmdline)
+
+  parts = Shellwords.split(cmdline)
+  parts << "--user-data-dir=#{dir}"
+  parts.shelljoin
+rescue
+  cmdline
+end
+
+def pick_terminal
+  %w[x-terminal-emulator gnome-terminal konsole xfce4-terminal kitty alacritty xterm].each do |t|
+    return t if which(t)
+  end
+  nil
+end
+
+SUDO_PRESERVE_ENV = "DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR,PULSE_SERVER,SSH_AUTH_SOCK"
+
+if Process.euid == 0
+  warn "Do not run this GUI as root. Run: mullvad-netns-gui"
+  exit 1
+end
+
+unless which("mullvad-netns")
+  warn "mullvad-netns not found in PATH."
+  exit 1
+end
+
+Gtk.init
+
+window = Gtk::Window.new(APP_TITLE)
+window.set_default_size(900, 620)
+
+outer = Gtk::Box.new(:vertical, 8)
+outer.margin = 10
+window.add(outer)
+
+header = Gtk::Label.new
+header.set_markup("<b>#{APP_TITLE}</b>")
+header.halign = :start
+outer.pack_start(header, expand: false, fill: true, padding: 0)
+
+notebook = Gtk::Notebook.new
+outer.pack_start(notebook, expand: true, fill: true, padding: 0)
+
+# ---- Tunnel tab ----
+tunnel_box = Gtk::Box.new(:vertical, 8)
+tunnel_box.margin = 6
+
+config_row = Gtk::Box.new(:horizontal, 8)
+config_dir_entry = Gtk::Entry.new
+config_dir_entry.hexpand = true
+config_dir_entry.placeholder_text = "Config directory containing .conf files"
+config_dir_entry.text = default_config_dirs.first.to_s
+
+config_dir_btn = Gtk::Button.new(label: "Browse…")
+config_row.pack_start(Gtk::Label.new("Config dir:"), expand: false, fill: false, padding: 0)
+config_row.pack_start(config_dir_entry, expand: true, fill: true, padding: 0)
+config_row.pack_start(config_dir_btn, expand: false, fill: false, padding: 0)
+tunnel_box.pack_start(config_row, expand: false, fill: true, padding: 0)
+
+conf_row = Gtk::Box.new(:horizontal, 8)
+conf_store = Gtk::ListStore.new(String, String) # label, fullpath
+conf_combo = Gtk::ComboBox.new(model: conf_store)
+renderer = Gtk::CellRendererText.new
+conf_combo.pack_start(renderer, true)
+conf_combo.add_attribute(renderer, "text", 0)
+conf_combo.hexpand = true
+
+conf_browse = Gtk::Button.new(label: "Pick file…")
+conf_random = Gtk::Button.new(label: "Random")
+conf_row.pack_start(Gtk::Label.new("Config:"), expand: false, fill: false, padding: 0)
+conf_row.pack_start(conf_combo, expand: true, fill: true, padding: 0)
+conf_row.pack_start(conf_random, expand: false, fill: false, padding: 0)
+conf_row.pack_start(conf_browse, expand: false, fill: false, padding: 0)
+tunnel_box.pack_start(conf_row, expand: false, fill: true, padding: 0)
+
+opts_row = Gtk::Box.new(:horizontal, 12)
+allow_lan_chk = Gtk::CheckButton.new("Allow LAN routes in netns")
+allow_lan_chk.active = true
+killswitch_chk = Gtk::CheckButton.new("Netns killswitch (prevent leaks)")
+killswitch_chk.active = true
+opts_row.pack_start(allow_lan_chk, expand: false, fill: false, padding: 0)
+opts_row.pack_start(killswitch_chk, expand: false, fill: false, padding: 0)
+tunnel_box.pack_start(opts_row, expand: false, fill: true, padding: 0)
+
+btn_row = Gtk::Box.new(:horizontal, 8)
+btn_up = Gtk::Button.new(label: "Up")
+btn_down = Gtk::Button.new(label: "Down")
+btn_repair = Gtk::Button.new(label: "Repair")
+btn_teardown = Gtk::Button.new(label: "Teardown")
+btn_status = Gtk::Button.new(label: "Status")
+btn_row.pack_start(btn_up, expand: false, fill: false, padding: 0)
+btn_row.pack_start(btn_down, expand: false, fill: false, padding: 0)
+btn_row.pack_start(btn_repair, expand: false, fill: false, padding: 0)
+btn_row.pack_start(btn_teardown, expand: false, fill: false, padding: 0)
+btn_row.pack_start(btn_status, expand: false, fill: false, padding: 0)
+tunnel_box.pack_start(btn_row, expand: false, fill: true, padding: 0)
+
+status_label = Gtk::Label.new("Status: unknown")
+status_label.halign = :start
+tunnel_box.pack_start(status_label, expand: false, fill: true, padding: 0)
+
+tunnel_log = Gtk::TextView.new
+tunnel_log.editable = false
+tunnel_log.monospace = true if tunnel_log.respond_to?(:monospace=)
+tunnel_scroll = Gtk::ScrolledWindow.new
+tunnel_scroll.add(tunnel_log)
+tunnel_box.pack_start(tunnel_scroll, expand: true, fill: true, padding: 0)
+
+notebook.append_page(tunnel_box, Gtk::Label.new("Tunnel"))
+
+def refill_confs(store, combo, dir, status_label)
+  store.clear
+  paths = list_confs(dir)
+  paths.each do |path|
+    iter = store.append
+    iter[0] = File.basename(path)
+    iter[1] = path
+  end
+  if paths.any?
+    combo.active = 0
+    status_label.text = "Status: configs=#{paths.size}"
+  else
+    status_label.text = "Status: no configs found in #{dir}"
+  end
+end
+
+refill_confs(conf_store, conf_combo, config_dir_entry.text, status_label)
+
+config_dir_btn.signal_connect("clicked") do
+  dialog = Gtk::FileChooserDialog.new(
+    title: "Select config directory",
+    parent: window,
+    action: Gtk::FileChooserAction::SELECT_FOLDER,
+    buttons: [[Gtk::Stock::CANCEL, Gtk::ResponseType::CANCEL], [Gtk::Stock::OPEN, Gtk::ResponseType::ACCEPT]],
+  )
+  if dialog.run == Gtk::ResponseType::ACCEPT
+    config_dir_entry.text = dialog.filename
+    refill_confs(conf_store, conf_combo, config_dir_entry.text, status_label)
+  end
+  dialog.destroy
+end
+
+config_dir_entry.signal_connect("changed") do
+  # debounce-ish: refresh when a valid directory appears
+  dir = config_dir_entry.text
+  next unless File.directory?(dir)
+  refill_confs(conf_store, conf_combo, dir, status_label)
+end
+
+conf_browse.signal_connect("clicked") do
+  dialog = Gtk::FileChooserDialog.new(
+    title: "Select Mullvad WireGuard config (.conf)",
+    parent: window,
+    action: Gtk::FileChooserAction::OPEN,
+    buttons: [[Gtk::Stock::CANCEL, Gtk::ResponseType::CANCEL], [Gtk::Stock::OPEN, Gtk::ResponseType::ACCEPT]],
+  )
+  filter = Gtk::FileFilter.new
+  filter.name = "WireGuard configs (*.conf)"
+  filter.add_pattern("*.conf")
+  dialog.add_filter(filter)
+  if dialog.run == Gtk::ResponseType::ACCEPT
+    file = dialog.filename
+    config_dir_entry.text = File.dirname(file)
+    refill_confs(conf_store, conf_combo, config_dir_entry.text, status_label)
+    # pick the selected file
+    iter = conf_store.each.find { |it| it[1] == file }
+    conf_combo.active_iter = iter if iter
+  end
+  dialog.destroy
+end
+
+conf_random.signal_connect("clicked") do
+  count = conf_store.iter_n_children(nil)
+  next if count <= 0
+  conf_combo.active = rand(count)
+end
+
+def selected_conf(combo)
+  iter = combo.active_iter
+  iter ? iter[1] : nil
+end
+
+def ui_run_and_log(window, buffer, status_label, capture:, argv:, label:)
+  if argv.first == "sudo" && !sudo_ok?
+    show_error(window, "Passwordless sudo is required (sudo -n true failed).")
+    return
+  end
+
+  append_text(buffer, "\n$ #{argv.shelljoin}\n")
+  worker = capture ? run_capture(argv, label: label) : run_detached(argv, label: label)
+
+  GLib::Timeout.add(100) do
+    if worker.alive?
+      true
+    else
+      _lbl, _argv, out, err, code = worker.value
+      append_text(buffer, out) unless out.empty?
+      append_text(buffer, err) unless err.empty?
+      append_text(buffer, "(exit #{code})\n")
+      status_label.text = "Status: #{label} exit=#{code}"
+      false
+    end
+  end
+end
+
+btn_up.signal_connect("clicked") do
+  begin
+    conf = selected_conf(conf_combo)
+    next unless conf && File.file?(conf)
+    env_args = ["env", "ALLOW_LAN=#{allow_lan_chk.active? ? 1 : 0}", "KILLSWITCH=#{killswitch_chk.active? ? 1 : 0}"]
+    argv = ["sudo", "-n", *env_args, "mullvad-netns", "up", "--config", conf]
+    ui_run_and_log(window, tunnel_log.buffer, status_label, capture: true, argv: argv, label: "up")
+  rescue => e
+    show_error(window, "#{e.class}: #{e.message}")
+  end
+end
+
+btn_down.signal_connect("clicked") do
+  begin
+    argv = ["sudo", "-n", "mullvad-netns", "down"]
+    ui_run_and_log(window, tunnel_log.buffer, status_label, capture: true, argv: argv, label: "down")
+  rescue => e
+    show_error(window, "#{e.class}: #{e.message}")
+  end
+end
+
+btn_repair.signal_connect("clicked") do
+  begin
+    env_args = ["env", "ALLOW_LAN=#{allow_lan_chk.active? ? 1 : 0}", "KILLSWITCH=#{killswitch_chk.active? ? 1 : 0}"]
+    argv = ["sudo", "-n", *env_args, "mullvad-netns", "repair"]
+    ui_run_and_log(window, tunnel_log.buffer, status_label, capture: true, argv: argv, label: "repair")
+  rescue => e
+    show_error(window, "#{e.class}: #{e.message}")
+  end
+end
+
+btn_teardown.signal_connect("clicked") do
+  begin
+    argv = ["sudo", "-n", "mullvad-netns", "teardown"]
+    ui_run_and_log(window, tunnel_log.buffer, status_label, capture: true, argv: argv, label: "teardown")
+  rescue => e
+    show_error(window, "#{e.class}: #{e.message}")
+  end
+end
+
+btn_status.signal_connect("clicked") do
+  begin
+    argv = ["mullvad-netns", "status"]
+    ui_run_and_log(window, tunnel_log.buffer, status_label, capture: true, argv: argv, label: "status")
+  rescue => e
+    show_error(window, "#{e.class}: #{e.message}")
+  end
+end
+
+# ---- Run tab ----
+run_box = Gtk::Box.new(:vertical, 8)
+run_box.margin = 6
+
+user_row = Gtk::Box.new(:horizontal, 8)
+user_entry = Gtk::Entry.new
+user_entry.text = ENV["USER"].to_s
+user_row.pack_start(Gtk::Label.new("Run as user:"), expand: false, fill: false, padding: 0)
+user_row.pack_start(user_entry, expand: false, fill: false, padding: 0)
+run_box.pack_start(user_row, expand: false, fill: true, padding: 0)
+
+apps = desktop_entries
+apps_store = Gtk::ListStore.new(String, String, String) # name, exec, file
+apps.each do |e|
+  it = apps_store.append
+  it[0] = e.name
+  it[1] = e.exec
+  it[2] = e.file
+end
+
+search_row = Gtk::Box.new(:horizontal, 8)
+app_search = Gtk::Entry.new
+app_search.placeholder_text = "Search desktop apps…"
+search_row.pack_start(Gtk::Label.new("Apps:"), expand: false, fill: false, padding: 0)
+search_row.pack_start(app_search, expand: true, fill: true, padding: 0)
+run_box.pack_start(search_row, expand: false, fill: true, padding: 0)
+
+apps_filter = apps_store.filter_new
+apps_filter.set_visible_func do |model, iter|
+  q = app_search.text.to_s.downcase.strip
+  next true if q.empty?
+  model.get_value(iter, 0).to_s.downcase.include?(q) || model.get_value(iter, 1).to_s.downcase.include?(q)
+end
+
+apps_view = Gtk::TreeView.new(apps_filter)
+col = Gtk::TreeViewColumn.new("Name", Gtk::CellRendererText.new, text: 0)
+apps_view.append_column(col)
+apps_scroll = Gtk::ScrolledWindow.new
+apps_scroll.set_size_request(-1, 180)
+apps_scroll.add(apps_view)
+run_box.pack_start(apps_scroll, expand: false, fill: true, padding: 0)
+
+cmd_row = Gtk::Box.new(:horizontal, 8)
+cmd_entry = Gtk::Entry.new
+cmd_entry.hexpand = true
+cmd_entry.placeholder_text = "Command to run inside the VPN netns (e.g. firefox, curl -4 ifconfig.me/ip)"
+fill_btn = Gtk::Button.new(label: "Use selected app")
+cmd_row.pack_start(Gtk::Label.new("Command:"), expand: false, fill: false, padding: 0)
+cmd_row.pack_start(cmd_entry, expand: true, fill: true, padding: 0)
+cmd_row.pack_start(fill_btn, expand: false, fill: false, padding: 0)
+run_box.pack_start(cmd_row, expand: false, fill: true, padding: 0)
+
+chrome_row = Gtk::Box.new(:horizontal, 12)
+chrome_profile_chk = Gtk::CheckButton.new("Isolate Chrome/Chromium profile (recommended)")
+chrome_profile_chk.active = true
+chrome_profile_entry = Gtk::Entry.new
+chrome_profile_entry.hexpand = true
+chrome_profile_entry.text = File.join(Dir.home, ".config/google-chrome-mvpn")
+chrome_profile_entry.placeholder_text = "/path/to/profile-dir (user-data-dir)"
+chrome_row.pack_start(chrome_profile_chk, expand: false, fill: false, padding: 0)
+chrome_row.pack_start(chrome_profile_entry, expand: true, fill: true, padding: 0)
+run_box.pack_start(chrome_row, expand: false, fill: true, padding: 0)
+
+run_btn_row = Gtk::Box.new(:horizontal, 8)
+btn_run = Gtk::Button.new(label: "Run (capture output)")
+btn_launch = Gtk::Button.new(label: "Launch (detached)")
+btn_term = Gtk::Button.new(label: "Open terminal in VPN")
+run_btn_row.pack_start(btn_run, expand: false, fill: false, padding: 0)
+run_btn_row.pack_start(btn_launch, expand: false, fill: false, padding: 0)
+run_btn_row.pack_start(btn_term, expand: false, fill: false, padding: 0)
+run_box.pack_start(run_btn_row, expand: false, fill: true, padding: 0)
+
+run_status = Gtk::Label.new("Status: idle")
+run_status.halign = :start
+run_box.pack_start(run_status, expand: false, fill: true, padding: 0)
+
+run_log = Gtk::TextView.new
+run_log.editable = false
+run_log.monospace = true if run_log.respond_to?(:monospace=)
+run_scroll = Gtk::ScrolledWindow.new
+run_scroll.add(run_log)
+run_box.pack_start(run_scroll, expand: true, fill: true, padding: 0)
+
+notebook.append_page(run_box, Gtk::Label.new("Run"))
+
+app_search.signal_connect("changed") { apps_filter.refilter }
+
+def selected_app_exec(treeview)
+  sel = treeview.selection
+  model, iter = sel.selected
+  return nil unless iter
+  [model.get_value(iter, 0).to_s, model.get_value(iter, 1).to_s, model.get_value(iter, 2).to_s]
+end
+
+fill_btn.signal_connect("clicked") do
+  _name, exec_line, _file = selected_app_exec(apps_view)
+  next unless exec_line && !exec_line.empty?
+  cmd_entry.text = sanitize_exec(exec_line)
+end
+
+apps_view.signal_connect("row-activated") do
+  _name, exec_line, _file = selected_app_exec(apps_view)
+  next unless exec_line && !exec_line.empty?
+  cmd_entry.text = sanitize_exec(exec_line)
+end
+
+def build_exec_argv(user, cmdline)
+  parts = Shellwords.split(cmdline)
+  raise ArgumentError, "empty command" if parts.empty?
+  ["sudo", "-n", "--preserve-env=#{SUDO_PRESERVE_ENV}", "mullvad-netns", "exec", "--user", user, "--", *parts]
+end
+
+btn_run.signal_connect("clicked") do
+  begin
+    user = user_entry.text.to_s.strip
+    cmdline = cmd_entry.text.to_s
+    if chrome_profile_chk.active?
+      cmdline = ensure_user_data_dir(cmdline, chrome_profile_entry.text.to_s.strip)
+      cmd_entry.text = cmdline
+    end
+    argv = build_exec_argv(user, cmdline)
+    ui_run_and_log(window, run_log.buffer, run_status, capture: true, argv: argv, label: "exec")
+  rescue => e
+    dialog = Gtk::MessageDialog.new(parent: window, flags: :destroy_with_parent, type: :error, buttons_type: :close, message: e.message)
+    dialog.run
+    dialog.destroy
+  end
+end
+
+btn_launch.signal_connect("clicked") do
+  begin
+    user = user_entry.text.to_s.strip
+    cmdline = cmd_entry.text.to_s
+    if chrome_profile_chk.active?
+      cmdline = ensure_user_data_dir(cmdline, chrome_profile_entry.text.to_s.strip)
+      cmd_entry.text = cmdline
+    end
+    argv = build_exec_argv(user, cmdline)
+    ui_run_and_log(window, run_log.buffer, run_status, capture: false, argv: argv, label: "launch")
+  rescue => e
+    dialog = Gtk::MessageDialog.new(parent: window, flags: :destroy_with_parent, type: :error, buttons_type: :close, message: e.message)
+    dialog.run
+    dialog.destroy
+  end
+end
+
+btn_term.signal_connect("clicked") do
+  term = pick_terminal
+  if term.nil?
+    dialog = Gtk::MessageDialog.new(parent: window, flags: :destroy_with_parent, type: :error, buttons_type: :close, message: "No terminal emulator found in PATH.")
+    dialog.run
+    dialog.destroy
+    next
+  end
+  user = user_entry.text.to_s.strip
+  argv = ["sudo", "-n", "--preserve-env=#{SUDO_PRESERVE_ENV}", "mullvad-netns", "exec", "--user", user, "--", term]
+  ui_run_and_log(window, run_log.buffer, run_status, capture: false, argv: argv, label: "terminal")
+end
+
+window.signal_connect("destroy") { Gtk.main_quit }
+window.show_all
+
+unless sudo_ok?
+  dialog = Gtk::MessageDialog.new(parent: window, flags: :destroy_with_parent, type: :warning, buttons_type: :close, message: "Note: passwordless sudo is required for Up/Down/Exec. (sudo -n true failed)")
+  dialog.run
+  dialog.destroy
+end
+
+Gtk.main
